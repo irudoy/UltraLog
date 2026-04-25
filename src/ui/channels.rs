@@ -270,6 +270,7 @@ impl UltraLogApp {
 
         // Get selected channels from the active tab
         let selected_channels = self.get_selected_channels().to_vec();
+        let cursor_record = self.get_cursor_record();
 
         // Pre-compute all display data to avoid borrow conflicts in closure
         struct ChannelCardData {
@@ -282,6 +283,8 @@ impl UltraLogApp {
             max_record: Option<usize>,
             min_time: Option<f64>,
             max_time: Option<f64>,
+            current_str: Option<String>,
+            gauge_fill: Option<f32>,
         }
 
         let mut channel_cards: Vec<ChannelCardData> = Vec::with_capacity(selected_channels.len());
@@ -298,80 +301,114 @@ impl UltraLogApp {
                 channel_name
             };
 
-            // Get actual data min/max with record indices
-            let (min_str, max_str, min_record, max_record, min_time, max_time) =
-                if selected.file_index < self.files.len() {
-                    let file = &self.files[selected.file_index];
-                    let times = file.log.get_times_as_f64();
+            // Get actual data min/max with record indices, plus current value at cursor
+            let (
+                min_str,
+                max_str,
+                min_record,
+                max_record,
+                min_time,
+                max_time,
+                current_str,
+                gauge_fill,
+            ) = if selected.file_index < self.files.len() {
+                let file = &self.files[selected.file_index];
+                let times = file.log.get_times_as_f64();
 
-                    // Get data from either regular channel or computed channel
-                    let data: Vec<f64> = if selected.channel.is_computed() {
-                        // For computed channels, get data from file_computed_channels
-                        let regular_count = file.log.channels.len();
-                        if selected.channel_index >= regular_count {
-                            let computed_idx = selected.channel_index - regular_count;
-                            self.file_computed_channels
-                                .get(&selected.file_index)
-                                .and_then(|channels| channels.get(computed_idx))
-                                .and_then(|c| c.cached_data.clone())
-                                .unwrap_or_default()
-                        } else {
-                            Vec::new()
-                        }
+                // Get data from either regular channel or computed channel
+                let data: Vec<f64> = if selected.channel.is_computed() {
+                    // For computed channels, get data from file_computed_channels
+                    let regular_count = file.log.channels.len();
+                    if selected.channel_index >= regular_count {
+                        let computed_idx = selected.channel_index - regular_count;
+                        self.file_computed_channels
+                            .get(&selected.file_index)
+                            .and_then(|channels| channels.get(computed_idx))
+                            .and_then(|c| c.cached_data.clone())
+                            .unwrap_or_default()
                     } else {
-                        // Regular channel data
-                        file.log.get_channel_data(selected.channel_index)
-                    };
-
-                    if !data.is_empty() {
-                        // Find min and max with their indices (filter out NaN values)
-                        let valid_data: Vec<(usize, f64)> = data
-                            .iter()
-                            .enumerate()
-                            .filter(|(_, v)| v.is_finite())
-                            .map(|(i, v)| (i, *v))
-                            .collect();
-
-                        if valid_data.is_empty() {
-                            (None, None, None, None, None, None)
-                        } else {
-                            let (min_idx, min_val) = valid_data
-                                .iter()
-                                .min_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
-                                .map(|(i, v)| (*i, *v))
-                                .unwrap();
-                            let (max_idx, max_val) = valid_data
-                                .iter()
-                                .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
-                                .map(|(i, v)| (*i, *v))
-                                .unwrap();
-
-                            let source_unit = selected.channel.unit();
-                            let (conv_min, display_unit) =
-                                self.unit_preferences.convert_value(min_val, source_unit);
-                            let (conv_max, _) =
-                                self.unit_preferences.convert_value(max_val, source_unit);
-                            let unit_str = if display_unit.is_empty() {
-                                String::new()
-                            } else {
-                                format!(" {}", display_unit)
-                            };
-
-                            (
-                                Some(format!("{:.1}{}", conv_min, unit_str)),
-                                Some(format!("{:.1}{}", conv_max, unit_str)),
-                                Some(min_idx),
-                                Some(max_idx),
-                                times.get(min_idx).copied(),
-                                times.get(max_idx).copied(),
-                            )
-                        }
-                    } else {
-                        (None, None, None, None, None, None)
+                        Vec::new()
                     }
                 } else {
-                    (None, None, None, None, None, None)
+                    // Regular channel data
+                    file.log.get_channel_data(selected.channel_index)
                 };
+
+                if !data.is_empty() {
+                    // Find min and max with their indices (filter out NaN values)
+                    let valid_data: Vec<(usize, f64)> = data
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, v)| v.is_finite())
+                        .map(|(i, v)| (i, *v))
+                        .collect();
+
+                    if valid_data.is_empty() {
+                        (None, None, None, None, None, None, None, None)
+                    } else {
+                        let (min_idx, min_val) = valid_data
+                            .iter()
+                            .min_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
+                            .map(|(i, v)| (*i, *v))
+                            .unwrap();
+                        let (max_idx, max_val) = valid_data
+                            .iter()
+                            .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
+                            .map(|(i, v)| (*i, *v))
+                            .unwrap();
+
+                        let source_unit = selected.channel.unit();
+                        let (conv_min, display_unit) =
+                            self.unit_preferences.convert_value(min_val, source_unit);
+                        let (conv_max, _) =
+                            self.unit_preferences.convert_value(max_val, source_unit);
+                        let unit_str = if display_unit.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" {}", display_unit)
+                        };
+
+                        // Current value at cursor (raw, source units) and gauge fill fraction
+                        let current_raw = cursor_record
+                            .and_then(|rec| data.get(rec).copied())
+                            .filter(|v| v.is_finite());
+
+                        let (current_str, gauge_fill) = if let Some(raw) = current_raw {
+                            let (conv_cur, _) =
+                                self.unit_preferences.convert_value(raw, source_unit);
+                            let cur_str = format!("{:.1}{}", conv_cur, unit_str);
+
+                            // Gauge bounds: prefer spec/parser display range, fall back to data
+                            let bound_lo = selected.channel.display_min().unwrap_or(min_val);
+                            let bound_hi = selected.channel.display_max().unwrap_or(max_val);
+                            let span = bound_hi - bound_lo;
+                            let fill = if span > 0.0 && span.is_finite() {
+                                Some((((raw - bound_lo) / span) as f32).clamp(0.0, 1.0))
+                            } else {
+                                None
+                            };
+                            (Some(cur_str), fill)
+                        } else {
+                            (None, None)
+                        };
+
+                        (
+                            Some(format!("{:.1}{}", conv_min, unit_str)),
+                            Some(format!("{:.1}{}", conv_max, unit_str)),
+                            Some(min_idx),
+                            Some(max_idx),
+                            times.get(min_idx).copied(),
+                            times.get(max_idx).copied(),
+                            current_str,
+                            gauge_fill,
+                        )
+                    }
+                } else {
+                    (None, None, None, None, None, None, None, None)
+                }
+            } else {
+                (None, None, None, None, None, None, None, None)
+            };
 
             channel_cards.push(ChannelCardData {
                 color: color32,
@@ -383,6 +420,8 @@ impl UltraLogApp {
                 max_record,
                 min_time,
                 max_time,
+                current_str,
+                gauge_fill,
             });
         }
 
@@ -392,11 +431,16 @@ impl UltraLogApp {
         egui::ScrollArea::horizontal().show(ui, |ui| {
             ui.horizontal(|ui| {
                 for (i, card) in channel_cards.iter().enumerate() {
-                    egui::Frame::NONE
+                    let frame_resp = egui::Frame::NONE
                         .fill(egui::Color32::from_rgb(40, 40, 40))
                         .stroke(egui::Stroke::new(2.0, card.color))
                         .corner_radius(5)
-                        .inner_margin(10.0)
+                        .inner_margin(egui::Margin {
+                            left: 26,
+                            right: 10,
+                            top: 10,
+                            bottom: 10,
+                        })
                         .show(ui, |ui| {
                             // Use horizontal layout with content on left, close button on right
                             // Align to top so cards with different heights don't stair-step
@@ -420,6 +464,23 @@ impl UltraLogApp {
                                                 .size(font_14),
                                         );
                                     });
+
+                                    // Show current value at cursor
+                                    if let Some(cur_str) = &card.current_str {
+                                        ui.horizontal(|ui| {
+                                            ui.label(
+                                                egui::RichText::new("Now:")
+                                                    .color(egui::Color32::GRAY)
+                                                    .size(font_12),
+                                            );
+                                            ui.label(
+                                                egui::RichText::new(cur_str)
+                                                    .color(card.color)
+                                                    .strong()
+                                                    .size(font_14),
+                                            );
+                                        });
+                                    }
 
                                     // Show min with jump button
                                     if let Some(min_str) = &card.min_str {
@@ -506,6 +567,38 @@ impl UltraLogApp {
                                 });
                             });
                         });
+
+                    // Paint the gauge strip on the left edge of the card frame.
+                    // Done after Frame::show so we know the actual content height.
+                    let frame_rect = frame_resp.response.rect;
+                    let strip_w = 5.0;
+                    let pad_x = 12.0;
+                    let pad_y = 10.0;
+                    let strip_rect = egui::Rect::from_min_max(
+                        egui::pos2(frame_rect.min.x + pad_x, frame_rect.min.y + pad_y),
+                        egui::pos2(frame_rect.min.x + pad_x + strip_w, frame_rect.max.y - pad_y),
+                    );
+                    let painter = ui.painter();
+                    painter.rect_filled(strip_rect, 1.5, egui::Color32::from_rgb(28, 28, 28));
+                    if let Some(frac) = card.gauge_fill {
+                        let h = strip_rect.height() * frac;
+                        if h > 0.0 {
+                            let fill_rect = egui::Rect::from_min_max(
+                                egui::pos2(strip_rect.min.x, strip_rect.max.y - h),
+                                strip_rect.max,
+                            );
+                            painter.rect_filled(fill_rect, 1.5, card.color);
+                        }
+                        // Bright tick at the current level for visibility on small fills
+                        let tick_y = strip_rect.max.y - h;
+                        painter.line_segment(
+                            [
+                                egui::pos2(strip_rect.min.x - 1.0, tick_y),
+                                egui::pos2(strip_rect.max.x + 1.0, tick_y),
+                            ],
+                            egui::Stroke::new(1.5, egui::Color32::WHITE),
+                        );
+                    }
 
                     ui.add_space(5.0);
                 }
